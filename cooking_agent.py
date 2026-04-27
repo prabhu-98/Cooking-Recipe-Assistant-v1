@@ -762,56 +762,81 @@ class CookingAgent:
         messages = self.get_messages(session_id)
         messages.append({"role": "user", "content": user_message})
 
-        # First LLM call - send user message with available tool definitions
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",   # LLM decides whether to use tools or respond directly
-            max_tokens=4096
-        )
-        assistant_msg = response.choices[0].message
-        messages.append(assistant_msg)
-
-        # Agentic loop - iteratively process tool calls until LLM gives a text response
-        max_iterations = 5  # Safety limit to prevent infinite loops
-        iteration = 0
-        while assistant_msg.tool_calls and iteration < max_iterations:
-            iteration += 1
-            
-            # Execute each tool call requested by the LLM
-            for tool_call in assistant_msg.tool_calls:
-                fn_name = tool_call.function.name
-                try:
-                    fn_args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    fn_args = {}
-                
-                # Look up and execute the tool function
-                tool_fn = TOOL_MAP.get(fn_name)
-                if tool_fn:
-                    result = tool_fn(fn_args)
-                else:
-                    result = json.dumps({"error": f"Unknown tool: {fn_name}"})
-                
-                # Append tool result to conversation for LLM to process
-                messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": fn_name,
-                    "content": result
-                })
-
-            # Follow-up LLM call with tool results
+        try:
+            # First LLM call - send user message with available tool definitions
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 tools=TOOLS,
-                tool_choice="auto",
+                tool_choice="auto",   # LLM decides whether to use tools or respond directly
                 max_tokens=4096
             )
             assistant_msg = response.choices[0].message
             messages.append(assistant_msg)
 
-        # Return the final text response
-        return assistant_msg.content or "I'm sorry, I couldn't generate a response. Please try again."
+            # Agentic loop - iteratively process tool calls until LLM gives a text response
+            max_iterations = 5  # Safety limit to prevent infinite loops
+            iteration = 0
+            while assistant_msg.tool_calls and iteration < max_iterations:
+                iteration += 1
+                
+                # Execute each tool call requested by the LLM
+                for tool_call in assistant_msg.tool_calls:
+                    fn_name = tool_call.function.name
+                    try:
+                        fn_args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        fn_args = {}
+                    
+                    # Look up and execute the tool function
+                    tool_fn = TOOL_MAP.get(fn_name)
+                    if tool_fn:
+                        result = tool_fn(fn_args)
+                    else:
+                        result = json.dumps({"error": f"Unknown tool: {fn_name}"})
+                    
+                    # Append tool result to conversation for LLM to process
+                    messages.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": fn_name,
+                        "content": result
+                    })
+
+                # Follow-up LLM call with tool results
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    max_tokens=4096
+                )
+                assistant_msg = response.choices[0].message
+                messages.append(assistant_msg)
+
+            # Return the final text response
+            return assistant_msg.content or "I'm sorry, I couldn't generate a response. Please try again."
+        
+        except Exception as e:
+            error_str = str(e)
+            # Handle Groq's tool_use_failed error by retrying without tools
+            if "tool_use_failed" in error_str or "400" in error_str:
+                logger.warning(f"Tool call failed, retrying without tools: {error_str[:100]}")
+                # Reset messages to just system prompt + user message
+                retry_messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message}
+                ]
+                try:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=retry_messages,
+                        max_tokens=4096
+                    )
+                    return response.choices[0].message.content or "Please try rephrasing your question."
+                except Exception as retry_err:
+                    logger.error(f"Retry also failed: {retry_err}")
+                    return f"I encountered an error. Please try again or rephrase your question."
+            else:
+                logger.error(f"Chat error: {error_str}")
+                raise
