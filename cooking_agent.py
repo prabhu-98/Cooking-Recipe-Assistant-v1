@@ -2,8 +2,12 @@
 Cooking Recipe Assistant - AI Agent Module
 ==========================================
 This module implements the core AI agent using Groq LLM with tool-calling capability.
-It provides a dual knowledge base system (Local JSON + TheMealDB API) and exposes
-5 tools that the LLM can autonomously invoke to answer user queries about recipes.
+It provides a HYBRID SEARCH system combining:
+- Fuzzy matching (exact ingredient matching)
+- Semantic search via ChromaDB (meaning-based queries)
+- TheMealDB API (external recipe database)
+
+The agent exposes 7 tools that the LLM can autonomously invoke.
 
 Architecture:
     User Query -> CookingAgent.chat() -> Groq LLM (with tool definitions)
@@ -13,6 +17,8 @@ Architecture:
 Dependencies:
     - groq: Groq API SDK for LLM inference
     - requests: HTTP client for TheMealDB API calls
+    - chromadb: Vector database for semantic search
+    - sentence-transformers: Text embedding model
     - python-dotenv: Environment variable management
 """
 
@@ -26,6 +32,10 @@ from groq import Groq
 # Load environment variables from .env file
 # override=True ensures new keys are picked up even if env vars are already set
 load_dotenv(override=True)
+
+# Import vector store for semantic search (ChromaDB)
+import logging
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -58,6 +68,18 @@ def load_knowledge_base():
 
 # Global recipe list - loaded once at module import time for performance
 RECIPES = load_knowledge_base()
+
+# Initialize the vector store for semantic search
+# This will download the embedding model on first run (~80MB) and index all recipes
+try:
+    from vector_store import RecipeVectorStore
+    vector_store = RecipeVectorStore(RECIPES)
+    VECTOR_STORE_READY = True
+    logger.info("Vector store initialized successfully")
+except Exception as e:
+    vector_store = None
+    VECTOR_STORE_READY = False
+    logger.warning(f"Vector store initialization failed: {e}. Semantic search disabled.")
 
 
 # =============================================================================
@@ -369,6 +391,111 @@ def list_all_recipes() -> str:
 
 
 # =============================================================================
+# TOOL 6: Semantic Search via ChromaDB (Vector Search)
+# =============================================================================
+# Uses sentence embeddings to find recipes by MEANING, not just keywords.
+# Handles queries like "quick healthy breakfast" or "comforting winter meal".
+
+def search_recipes_semantic(query: str) -> str:
+    """
+    Search recipes using semantic similarity via ChromaDB vector database.
+    
+    Unlike fuzzy matching which compares character strings, this uses
+    AI embeddings (all-MiniLM-L6-v2) to understand the MEANING of the query.
+    
+    Examples that work here but NOT with fuzzy matching:
+    - "something spicy and Indian" -> finds Butter Chicken, Dal Tadka
+    - "quick healthy breakfast" -> finds Banana Smoothie, Mango Lassi
+    - "romantic Italian dinner" -> finds Mushroom Risotto, Pasta Aglio e Olio
+    
+    Args:
+        query: Natural language search query.
+    
+    Returns:
+        str: JSON string with semantically matched recipes and similarity scores.
+    """
+    if not VECTOR_STORE_READY or vector_store is None:
+        return json.dumps({"error": "Semantic search is not available. Falling back to keyword search."})
+    
+    if not query or not query.strip():
+        return json.dumps({"error": "No search query provided."})
+    
+    try:
+        results = vector_store.search(query.strip(), n_results=6)
+        if not results:
+            return json.dumps({"source": "semantic_search", "message": f"No recipes semantically matched '{query}'." })
+        
+        return json.dumps({
+            "source": "semantic_search_chromadb",
+            "search_method": "vector_similarity (all-MiniLM-L6-v2)",
+            "query": query,
+            "recipes_found": len(results),
+            "matches": results
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"source": "semantic_search", "error": f"Semantic search failed: {str(e)}"})
+
+
+# =============================================================================
+# TOOL 7: Hybrid Search (Fuzzy + Semantic Combined)
+# =============================================================================
+# The best of both worlds: exact ingredient matching + meaning-based search.
+# This is the PRIMARY search tool for ingredient-based queries.
+
+def search_recipes_hybrid(query: str, ingredients: list[str] = None) -> str:
+    """
+    Perform hybrid search combining fuzzy ingredient matching AND semantic search.
+    
+    Strategy:
+    1. If ingredients provided: run fuzzy match for exact ingredient coverage
+    2. Always run semantic search on the query text for meaning-based matches
+    3. Merge and deduplicate results, prioritizing fuzzy matches for ingredient
+       accuracy while adding semantic matches for broader discovery.
+    
+    This prevents hallucination (fuzzy ensures real ingredients) while enabling
+    discovery (semantic finds contextually relevant recipes).
+    
+    Args:
+        query: The user's natural language query.
+        ingredients: Optional list of specific ingredients.
+    
+    Returns:
+        str: JSON string with combined results from both search methods.
+    """
+    combined_results = {"source": "hybrid_search", "fuzzy_results": [], "semantic_results": []}
+    seen_names = set()
+    
+    # Step 1: Fuzzy matching on ingredients (exact matching layer)
+    if ingredients:
+        fuzzy_raw = json.loads(search_recipes_local(ingredients))
+        if "top_matches" in fuzzy_raw:
+            for match in fuzzy_raw["top_matches"]:
+                seen_names.add(match["name"])
+                match["search_method"] = "fuzzy_ingredient_match"
+                combined_results["fuzzy_results"].append(match)
+    
+    # Step 2: Semantic search on query text (meaning-based layer)
+    if VECTOR_STORE_READY and vector_store:
+        try:
+            semantic_matches = vector_store.search(query.strip(), n_results=5)
+            for match in semantic_matches:
+                if match["name"] not in seen_names:  # Deduplicate
+                    match["search_method"] = "semantic_vector_search"
+                    combined_results["semantic_results"].append(match)
+                    seen_names.add(match["name"])
+        except Exception as e:
+            combined_results["semantic_error"] = str(e)
+    
+    total = len(combined_results["fuzzy_results"]) + len(combined_results["semantic_results"])
+    combined_results["total_results"] = total
+    
+    if total == 0:
+        return json.dumps({"source": "hybrid_search", "message": "No recipes found. Try different ingredients or a different description."})
+    
+    return json.dumps(combined_results, indent=2)
+
+
+# =============================================================================
 # TOOL DEFINITIONS FOR GROQ LLM
 # =============================================================================
 # These JSON schemas tell the Groq LLM what tools are available, what arguments
@@ -379,8 +506,47 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_recipes_hybrid",
+            "description": "HYBRID SEARCH: Combines fuzzy ingredient matching + semantic AI vector search. Use this as the PRIMARY search tool when users mention ingredients. It finds exact ingredient matches AND discovers semantically related recipes. Pass both a descriptive query AND an ingredient list.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language query describing what the user wants, e.g. 'quick spicy dinner with chicken'"
+                    },
+                    "ingredients": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of specific ingredients, e.g. ['chicken', 'garlic', 'rice']"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_recipes_semantic",
+            "description": "SEMANTIC SEARCH: Uses AI embeddings and ChromaDB vector database to find recipes by MEANING rather than exact keywords. Best for abstract queries like 'healthy breakfast', 'romantic Italian dinner', 'comfort food for winter'. Does NOT require ingredient names.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language description of desired recipe, e.g. 'light and healthy Mediterranean lunch'"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_recipes_local",
-            "description": "Search the LOCAL recipe knowledge base for recipes matching given ingredients. Returns ranked results with match percentages. Use this first when user mentions ingredients.",
+            "description": "FUZZY SEARCH: Search the LOCAL recipe knowledge base using fuzzy string matching on ingredient names. Best when user provides a specific list of ingredients and you need exact match percentages.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -461,6 +627,8 @@ TOOLS = [
 
 # Maps tool names to their corresponding Python functions for execution
 TOOL_MAP = {
+    "search_recipes_hybrid": lambda args: search_recipes_hybrid(args.get("query", ""), args.get("ingredients")),
+    "search_recipes_semantic": lambda args: search_recipes_semantic(args["query"]),
     "search_recipes_local": lambda args: search_recipes_local(args["ingredients"]),
     "search_recipes_api": lambda args: search_recipes_api(args["ingredient"]),
     "get_recipe_details_local": lambda args: get_recipe_details_local(args["recipe_name"]),
@@ -482,20 +650,26 @@ SYSTEM_PROMPT = """You are a friendly and knowledgeable Cooking Recipe Assistant
 3. Suggest ingredient substitutions when needed
 4. Give cooking tips and dietary information
 
-You have access to TWO recipe sources:
-- LOCAL Knowledge Base: 25 curated recipes with detailed instructions
-- TheMealDB API: 300+ online recipes for broader coverage
+You have access to THREE recipe search methods (HYBRID SEARCH ARCHITECTURE):
+- HYBRID SEARCH (search_recipes_hybrid): Combines fuzzy ingredient matching + semantic AI vector search. Use this as your PRIMARY tool when users mention specific ingredients.
+- SEMANTIC SEARCH (search_recipes_semantic): Uses ChromaDB vector database with AI embeddings. Best for abstract/descriptive queries like "comfort food", "healthy breakfast", "romantic dinner".
+- FUZZY SEARCH (search_recipes_local): Direct ingredient name matching. Use when you need precise match percentages.
+- TheMealDB API (search_recipes_api): 300+ online recipes for broader coverage.
 
-RULES:
-- When a user mentions ingredients, ALWAYS search the local KB first with search_recipes_local
-- Then also search the API with search_recipes_api using the most prominent ingredient for wider results
-- Use get_recipe_details_local for local recipes, get_recipe_details_api for API recipes
-- Use list_all_recipes when users want to browse available recipes
+SEARCH STRATEGY:
+- For ingredient-based queries: Use search_recipes_hybrid (it runs BOTH fuzzy + semantic automatically)
+- For mood/description queries ("something spicy", "quick lunch"): Use search_recipes_semantic
+- For broader online results: Also use search_recipes_api with the main ingredient
+- Use get_recipe_details_local or get_recipe_details_api to get full recipe instructions
+- Use list_all_recipes when users want to browse
+
+RESPONSE RULES:
 - Be warm, encouraging, and helpful
 - Format your responses clearly with emojis for better readability
 - If no recipes match, suggest what additional ingredients they could get
 - Mention dietary tags (vegetarian, vegan, gluten-free) when relevant
-- Always indicate the source (Local KB or Online API) when presenting recipes
+- Always indicate the search method used (Hybrid, Semantic, Fuzzy, or API) when presenting recipes
+- Highlight when semantic search found a contextually relevant match that fuzzy matching missed
 """
 
 

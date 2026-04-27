@@ -22,6 +22,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# ChromaDB persistent storage
+chroma_db/
+
 # Test/coverage reports
 htmlcov/
 .pytest_cache/

@@ -169,11 +169,18 @@ def server_error(e):
 if __name__ == "__main__":
     print("\n" + "=" * 55)
     print("  Cooking Recipe Assistant - Web Server")
+    print("  Hybrid Search: Fuzzy + Semantic (ChromaDB)")
     print("=" * 55)
     if agent_ready:
         print("  [OK] AI Agent ready (Groq LLM)")
         print("  [OK] Local KB: 25 recipes loaded")
         print("  [OK] TheMealDB API: connected")
+        from cooking_agent import VECTOR_STORE_READY
+        if VECTOR_STORE_READY:
+            print("  [OK] ChromaDB Vector Store: indexed")
+            print("  [OK] Hybrid Search: active")
+        else:
+            print("  [WARN] ChromaDB: not available (fuzzy only)")
     else:
         print(f"  [ERR] Agent error: {agent_error}")
     print("  Open http://localhost:5000 in your browser")

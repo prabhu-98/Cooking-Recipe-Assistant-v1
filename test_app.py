@@ -22,9 +22,12 @@ from cooking_agent import (
     get_recipe_details_local,
     get_recipe_details_api,
     list_all_recipes,
+    search_recipes_semantic,
+    search_recipes_hybrid,
     RECIPES,
     TOOLS,
     TOOL_MAP,
+    VECTOR_STORE_READY,
 )
 
 
@@ -233,8 +236,8 @@ class TestToolDefinitions(unittest.TestCase):
     """Tests for the Groq tool schema definitions."""
 
     def test_tool_count(self):
-        """Should have exactly 5 tool definitions."""
-        self.assertEqual(len(TOOLS), 5)
+        """Should have exactly 7 tool definitions (including hybrid and semantic)."""
+        self.assertEqual(len(TOOLS), 7)
 
     def test_tool_map_matches_definitions(self):
         """TOOL_MAP should have entries for all defined tools."""
@@ -252,7 +255,81 @@ class TestToolDefinitions(unittest.TestCase):
 
 
 # =============================================================================
-# TEST 7: TheMealDB API Integration
+# TEST 7: Semantic Search (ChromaDB)
+# =============================================================================
+
+class TestSemanticSearch(unittest.TestCase):
+    """Tests for ChromaDB semantic search."""
+
+    def test_vector_store_initialized(self):
+        """Vector store should be initialized."""
+        self.assertTrue(VECTOR_STORE_READY, "ChromaDB vector store should be ready")
+
+    def test_semantic_search_descriptive_query(self):
+        """Should find recipes using natural language descriptions."""
+        result = json.loads(search_recipes_semantic("spicy Indian dinner"))
+        self.assertIn("matches", result)
+        self.assertGreater(result["recipes_found"], 0)
+        indian_found = any("Indian" in m.get("cuisine", "") for m in result["matches"])
+        self.assertTrue(indian_found, "Should find Indian recipes")
+
+    def test_semantic_search_dietary_query(self):
+        """Should find recipes matching dietary preferences."""
+        result = json.loads(search_recipes_semantic("vegan gluten-free meal"))
+        self.assertIn("matches", result)
+        self.assertGreater(result["recipes_found"], 0)
+
+    def test_semantic_search_empty_query(self):
+        """Should handle empty query gracefully."""
+        result = json.loads(search_recipes_semantic(""))
+        self.assertIn("error", result)
+
+    def test_semantic_returns_similarity_scores(self):
+        """Results should include similarity scores."""
+        result = json.loads(search_recipes_semantic("Italian pasta"))
+        if result.get("matches"):
+            self.assertIn("similarity_score", result["matches"][0])
+
+
+# =============================================================================
+# TEST 8: Hybrid Search (Fuzzy + Semantic)
+# =============================================================================
+
+class TestHybridSearch(unittest.TestCase):
+    """Tests for hybrid search combining fuzzy and semantic methods."""
+
+    def test_hybrid_with_ingredients(self):
+        """Should return both fuzzy and semantic results."""
+        result = json.loads(search_recipes_hybrid("chicken dinner", ["chicken", "garlic"]))
+        self.assertIn("fuzzy_results", result)
+        self.assertIn("semantic_results", result)
+        self.assertGreater(result["total_results"], 0)
+
+    def test_hybrid_deduplication(self):
+        """Should not return the same recipe in both fuzzy and semantic results."""
+        result = json.loads(search_recipes_hybrid("chicken rice", ["chicken", "rice"]))
+        fuzzy_names = {r["name"] for r in result.get("fuzzy_results", [])}
+        semantic_names = {r["name"] for r in result.get("semantic_results", [])}
+        overlap = fuzzy_names & semantic_names
+        self.assertEqual(len(overlap), 0, f"Duplicate recipes found: {overlap}")
+
+    def test_hybrid_without_ingredients(self):
+        """Should work with just a query (semantic only)."""
+        result = json.loads(search_recipes_hybrid("healthy breakfast"))
+        self.assertIn("semantic_results", result)
+        self.assertGreater(result["total_results"], 0)
+
+    def test_hybrid_labels_search_method(self):
+        """Each result should indicate which search method found it."""
+        result = json.loads(search_recipes_hybrid("pasta dinner", ["garlic", "olive oil"]))
+        for r in result.get("fuzzy_results", []):
+            self.assertEqual(r["search_method"], "fuzzy_ingredient_match")
+        for r in result.get("semantic_results", []):
+            self.assertEqual(r["search_method"], "semantic_vector_search")
+
+
+# =============================================================================
+# TEST 9: TheMealDB API Integration
 # =============================================================================
 
 class TestMealDBApi(unittest.TestCase):
